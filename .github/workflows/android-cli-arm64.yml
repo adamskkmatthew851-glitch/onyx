@@ -1,0 +1,142 @@
+name: onyx-cli ARM64 bundle for Android
+
+# Builds the Onyx command-line program natively on an ARM64 runner inside
+# Ubuntu 20.04 (glibc 2.31, which avoids clone3/faccessat2 that Android's
+# app seccomp filter can reject), then bundles it with every shared library
+# it needs, including the glibc loader, so an Android app can run it with
+#   ./ld-linux-aarch64.so.1 --library-path . ./onyx-cli ...
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [android-arm64]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    container: ubuntu:20.04
+    timeout-minutes: 355
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Base tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl wget xz-utils file \
+            g++ gcc libc6-dev libffi-dev libgmp-dev make zlib1g-dev gnupg netbase libnuma-dev libtinfo-dev
+          git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: System packages
+        working-directory: haskell
+        run: ./pre-dependencies
+
+      - name: Submodule revisions
+        run: echo "SUBMODS=$(git submodule status --recursive | sha1sum | cut -c1-16)" >> $GITHUB_ENV
+
+      - name: Cache C dependencies
+        id: cdeps
+        uses: actions/cache@v4
+        with:
+          path: haskell/dependencies/root
+          key: cdeps-focal-arm64-${{ hashFiles('haskell/dependencies/Makefile') }}-${{ env.SUBMODS }}
+
+      - name: Build C dependencies
+        if: steps.cdeps.outputs.cache-hit != 'true'
+        working-directory: haskell
+        run: ./build-dependencies
+
+      - name: Install Stack
+        run: |
+          curl -sSL https://github.com/commercialhaskell/stack/releases/download/v3.11.1/stack-3.11.1-linux-aarch64.tar.gz -o stack.tgz
+          tar xzf stack.tgz --strip-components=1 -C /usr/local/bin stack-3.11.1-linux-aarch64/stack
+          rm stack.tgz
+          stack --version
+
+      - name: Restore Stack cache
+        id: stackcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.stack
+            haskell/.stack-work
+            haskell/packages/*/.stack-work
+          key: stack-focal-arm64-${{ hashFiles('haskell/stack.yaml') }}-${{ github.sha }}
+          restore-keys: |
+            stack-focal-arm64-${{ hashFiles('haskell/stack.yaml') }}-
+            stack-focal-arm64-
+
+      - name: Build Haskell dependencies
+        working-directory: haskell
+        run: ./stack-local build --only-dependencies -j4
+
+      - name: Save Stack cache (dependencies)
+        if: always() && steps.stackcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.stack
+            haskell/.stack-work
+            haskell/packages/*/.stack-work
+          key: stack-focal-arm64-${{ hashFiles('haskell/stack.yaml') }}-${{ github.sha }}
+
+      - name: Build onyx-cli
+        working-directory: haskell
+        run: |
+          ./stack-local build onyx-lib
+          ./stack-local build onyx-exe-toolkit:exe:onyx-cli onyx-exe-toolkit:exe:onyx-package
+
+      - name: Bundle
+        working-directory: haskell
+        run: |
+          ./copy-resources
+          B=../onyx-android
+          rm -rf $B && mkdir -p $B
+          cp "$(stack exec -- which onyx-cli)" $B/onyx-cli
+          strip $B/onyx-cli
+          cp -R resources $B/onyx-resources
+          stack exec -- onyx-package version-write $B/onyx-resources/README.html || true
+          VERSION=$(stack exec -- onyx-package version-print)
+          echo "$VERSION" > $B/VERSION
+          # every shared library, recursively, from the real loader's view
+          export LD_LIBRARY_PATH="$(pwd)"/dependencies/root/lib
+          ldd $B/onyx-cli
+          for lib in $(ldd $B/onyx-cli | awk '/=>/ {print $3} /ld-linux/ {print $1}'); do
+            cp -L "$lib" $B/
+          done
+          ls -la $B
+          tar czf ../onyx-cli-$VERSION-android-arm64.tar.gz -C .. onyx-android
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Smoke test (bundle only, clean environment)
+        run: |
+          cd onyx-android
+          env -i ./ld-linux-aarch64.so.1 --library-path . ./onyx-cli 2>&1 | head -40 | tee ../smoke.log
+          f=$(ls ../songs/*/notes.mid ../songs/*/*/notes.mid 2>/dev/null | head -1)
+          echo "MIDI test: $f" | tee -a ../smoke.log
+          [ -n "$f" ] && env -i HOME=/tmp LANG=C.UTF-8 ./ld-linux-aarch64.so.1 --library-path . ./onyx-cli midi-text "$f" --to /tmp/t.midtxt 2>&1 | tail -5 | tee -a ../smoke.log
+          head -c 400 /tmp/t.midtxt | tee -a ../smoke.log || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onyx-cli-android-arm64
+          path: |
+            onyx-cli-*-android-arm64.tar.gz
+            smoke.log
+
+      - name: Publish release asset
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apt-get install -y --no-install-recommends gh 2>/dev/null || (curl -sSL https://github.com/cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_arm64.tar.gz | tar xz && cp gh_*/bin/gh /usr/local/bin/)
+          gh release create "android-cli-$VERSION" onyx-cli-$VERSION-android-arm64.tar.gz \
+            -R ${{ github.repository }} --target ${{ github.sha }} --prerelease \
+            --title "onyx-cli $VERSION ARM64 bundle for Android" --notes "Built by GitHub Actions" \
+          || gh release upload "android-cli-$VERSION" onyx-cli-$VERSION-android-arm64.tar.gz -R ${{ github.repository }} --clobber
+    permissions:
+      contents: write
